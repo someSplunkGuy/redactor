@@ -3,7 +3,7 @@ import random
 import string
 import argparse
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from pathlib import Path
 from datetime import datetime
 
@@ -25,6 +25,35 @@ class LogRedactor:
     Each unique item gets a consistent random identifier for tracking.
     """
     
+    # File extensions that should NOT be redacted (config files, etc.)
+    EXCLUDED_FILE_EXTENSIONS: Set[str] = {
+        # Splunk config files
+        '.conf', '.meta', '.spec',
+        # Common config files
+        '.cfg', '.config', '.ini', '.yaml', '.yml', '.json', '.xml',
+        '.properties', '.props', '.toml',
+        # Log files
+        '.log', '.logs',
+        # Script/code files
+        '.py', '.sh', '.bash', '.pl', '.rb', '.js', '.java', '.c', '.cpp',
+        '.h', '.hpp', '.cs', '.go', '.rs', '.php', '.ps1', '.bat', '.cmd',
+        # Data files
+        '.csv', '.tsv', '.txt', '.dat', '.data',
+        # Certificate/key files
+        '.pem', '.crt', '.key', '.cer', '.p12', '.pfx', '.jks',
+        # Archive files
+        '.zip', '.tar', '.gz', '.tgz', '.bz2', '.7z', '.rar',
+        # Document files
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+        # Image files
+        '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico',
+        # Web files
+        '.html', '.htm', '.css', '.scss', '.less',
+        # Other common extensions
+        '.so', '.dll', '.exe', '.bin', '.lib', '.a', '.o',
+        '.pid', '.lock', '.sock', '.socket',
+    }
+    
     def __init__(self, seed: int = None):
         """
         Initialize the LogRedactor.
@@ -43,6 +72,36 @@ class LogRedactor:
         self.mac_mapping: Dict[str, str] = {}
         self.data_host_mapping: Dict[str, str] = {}
         self.connection_id_mapping: Dict[str, str] = {}
+        
+        # Build regex pattern for excluded file extensions
+        self._excluded_extensions_pattern = self._build_excluded_extensions_pattern()
+    
+    def _build_excluded_extensions_pattern(self) -> re.Pattern:
+        """Build a regex pattern to match filenames with excluded extensions."""
+        # Escape dots and join extensions
+        extensions = '|'.join(re.escape(ext) for ext in self.EXCLUDED_FILE_EXTENSIONS)
+        # Match word characters followed by any excluded extension
+        pattern = rf'\b[\w\-\.]+({extensions})\b'
+        return re.compile(pattern, re.IGNORECASE)
+    
+    def _is_excluded_filename(self, value: str) -> bool:
+        """
+        Check if a value looks like a filename with an excluded extension.
+        
+        Args:
+            value: The value to check
+            
+        Returns:
+            True if it appears to be a filename that should not be redacted
+        """
+        value_lower = value.lower()
+        
+        # Check if it ends with any excluded extension
+        for ext in self.EXCLUDED_FILE_EXTENSIONS:
+            if value_lower.endswith(ext):
+                return True
+        
+        return False
     
     def _generate_random_id(self) -> str:
         """Generate a random 6-digit identifier."""
@@ -61,13 +120,57 @@ class LogRedactor:
         
         return mapping[value_lower]
     
+    def _should_skip_value(self, value: str, additional_skip_values: Set[str] = None) -> bool:
+        """
+        Check if a value should be skipped from redaction.
+        
+        Args:
+            value: The value to check
+            additional_skip_values: Additional values to skip
+            
+        Returns:
+            True if the value should not be redacted
+        """
+        if not value or value.strip() == '':
+            return True
+        
+        # Skip if already redacted
+        if value.startswith('[REDACTED'):
+            return True
+        
+        # Skip if it's a filename with excluded extension
+        if self._is_excluded_filename(value):
+            return True
+        
+        # Skip if it's a number
+        if value.isdigit():
+            return True
+        
+        # Skip if it starts with a path separator
+        if value.startswith('/') or value.startswith('\\'):
+            return True
+        
+        # Default skip values
+        default_skip_values = {
+            'localhost', 'null', 'none', 'unknown', 'n/a', 'undefined',
+            'true', 'false', 'yes', 'no', 'ok', 'error', 'success',
+            'failed', 'failure', 'complete', 'completed', 'pending',
+            'enabled', 'disabled', 'active', 'inactive', 'on', 'off',
+            '0', '1', '-', '*', 'any', 'all', 'local', 'default',
+            'up', 'down', 'self',
+        }
+        
+        if additional_skip_values:
+            default_skip_values.update(additional_skip_values)
+        
+        if value.lower() in default_skip_values:
+            return True
+        
+        return False
+    
     def _redact_system_info(self, text: str) -> str:
         """
         Redact system info patterns that contain hostnames.
-        
-        Handles patterns like:
-        - System info: Linux, hostname, 6.8.0-1033-aws, ...
-        - uname: Linux hostname 5.4.0 ...
         """
         # Pattern for "System info: OS, hostname, kernel, ..."
         system_info_pattern = r'(System\s+info:\s*\w+,\s*)([^,\s]+)(,)'
@@ -77,8 +180,7 @@ class LogRedactor:
             hostname = match.group(2)
             suffix = match.group(3)
             
-            # Skip if already redacted
-            if hostname.startswith('[REDACTED'):
+            if self._should_skip_value(hostname):
                 return match.group(0)
             
             # Skip if it looks like a kernel version or number
@@ -100,7 +202,7 @@ class LogRedactor:
             hostname = match.group(2)
             suffix = match.group(3)
             
-            if hostname.startswith('[REDACTED'):
+            if self._should_skip_value(hostname):
                 return match.group(0)
             
             redacted = self._get_or_create_redacted_id(
@@ -115,13 +217,6 @@ class LogRedactor:
     def _redact_node_references(self, text: str) -> str:
         """
         Redact node/member references in log messages.
-        
-        Handles patterns like:
-        - Node hostname is already part of
-        - Node hostname joined
-        - member hostname
-        - peer hostname
-        - captain hostname
         """
         patterns = [
             # "Node hostname is/has/joined/etc"
@@ -136,12 +231,8 @@ class LogRedactor:
         
         result = text
         
-        skip_values = {
-            'localhost', 'null', 'none', 'unknown', 'n/a', '', 'undefined',
-            'true', 'false', 'yes', 'no', 'ok', 'error', 'success',
-            'is', 'has', 'was', 'been', 'the', 'and', 'for', 'to', 'from',
-            'id', 'uri', 'url', 'status', 'info', 'data', 'with',
-        }
+        additional_skip = {'is', 'has', 'was', 'been', 'the', 'and', 'for', 'to', 'from',
+                          'id', 'uri', 'url', 'status', 'info', 'data', 'with'}
         
         for pattern_tuple in patterns:
             if len(pattern_tuple) == 4:
@@ -153,13 +244,7 @@ class LogRedactor:
                         hostname = match.group(grp2)
                         suffix = match.group(grp3) if grp3 else ''
                         
-                        if hostname.startswith('[REDACTED'):
-                            return match.group(0)
-                        
-                        if hostname.lower() in skip_values:
-                            return match.group(0)
-                        
-                        if hostname.isdigit():
+                        if self._should_skip_value(hostname, additional_skip):
                             return match.group(0)
                         
                         redacted = self._get_or_create_redacted_id(
@@ -177,13 +262,7 @@ class LogRedactor:
                         prefix = match.group(grp1)
                         hostname = match.group(grp2)
                         
-                        if hostname.startswith('[REDACTED'):
-                            return match.group(0)
-                        
-                        if hostname.lower() in skip_values:
-                            return match.group(0)
-                        
-                        if hostname.isdigit():
+                        if self._should_skip_value(hostname, additional_skip):
                             return match.group(0)
                         
                         redacted = self._get_or_create_redacted_id(
@@ -235,37 +314,12 @@ class LogRedactor:
         # Pattern: key=value (with optional quotes)
         pattern = rf'\b({keys_pattern})\s*=\s*(["\']?)([^"\'\s,;\]\}}\)\[]+)\2'
         
-        # Skip values that shouldn't be redacted
-        skip_values = {
-            'localhost', 'null', 'none', 'unknown', 'n/a', 'undefined',
-            'true', 'false', 'yes', 'no', 'ok', 'error', 'success',
-            'failed', 'failure', 'complete', 'completed', 'pending',
-            'enabled', 'disabled', 'active', 'inactive', 'on', 'off',
-            '0', '1', '-', '*', 'any', 'all', 'local', 'default',
-            'up', 'down', 'self',
-        }
-        
         def replace_kv_hostname(match):
             key = match.group(1)
             quote = match.group(2)
             value = match.group(3)
             
-            # Handle empty values
-            if not value or value.strip() == '':
-                return match.group(0)
-            
-            # Skip if already redacted
-            if value.startswith('[REDACTED'):
-                return match.group(0)
-            
-            # Skip common non-hostname values
-            if value.lower() in skip_values:
-                return match.group(0)
-            
-            # Skip if it looks like a number, port, or path
-            if value.isdigit():
-                return match.group(0)
-            if value.startswith('/'):
+            if self._should_skip_value(value):
                 return match.group(0)
             
             redacted = self._get_or_create_redacted_id(
@@ -335,15 +389,14 @@ class LogRedactor:
             
             # "Using REMOTE_SERVER_NAME=" pattern
             (r'(Using\s+\w+\s*=\s*)([^\s,;\]\}"\']+)', 2),
+            
+            # "in <filename>" patterns - need to exclude config files
+            (r'((?:in|from|see|refer\s+to)\s+)([^\s,;\]\}"\']+)', 2),
         ]
         
         result = text
         
-        # Skip values that shouldn't be redacted
-        skip_values = {'localhost', 'null', 'none', 'unknown', 'n/a', '', 
-                       'true', 'false', 'yes', 'no', 'ok', 'error', 'success',
-                       'failed', 'failure', 'complete', 'completed', 'pending',
-                       'with', 'has', 'been', 'the', 'and', 'for', 'inside'}
+        additional_skip = {'with', 'has', 'been', 'the', 'and', 'for', 'inside'}
         
         for pattern, value_group in patterns:
             def make_replacer(val_group):
@@ -351,16 +404,7 @@ class LogRedactor:
                     prefix = match.group(1)
                     value = match.group(val_group)
                     
-                    # Skip if already redacted
-                    if value.startswith('[REDACTED'):
-                        return match.group(0)
-                    
-                    # Skip common non-hostname values
-                    if value.lower() in skip_values:
-                        return match.group(0)
-                    
-                    # Skip if it looks like a number or port
-                    if value.isdigit():
+                    if self._should_skip_value(value, additional_skip):
                         return match.group(0)
                     
                     redacted = self._get_or_create_redacted_id(
@@ -383,6 +427,10 @@ class LogRedactor:
             prefix = match.group(1)
             value = match.group(2)
             suffix = match.group(3)
+            
+            if self._should_skip_value(value):
+                return match.group(0)
+            
             redacted = self._get_or_create_redacted_id(
                 value, self.connection_id_mapping, 'CONNID'
             )
@@ -395,6 +443,10 @@ class LogRedactor:
         def replace_connection_id2(match):
             prefix = match.group(1)
             value = match.group(2)
+            
+            if self._should_skip_value(value):
+                return match.group(0)
+            
             redacted = self._get_or_create_redacted_id(
                 value, self.connection_id_mapping, 'CONNID'
             )
@@ -454,23 +506,13 @@ class LogRedactor:
         
         result = text
         
-        # Skip values that shouldn't be redacted
-        skip_values = {'localhost', 'null', 'none', 'unknown', 'n/a', '', 
-                       'true', 'false', '0.0.0.0', '127.0.0.1', 'up', 'down',
-                       'enabled', 'disabled', 'active', 'inactive'}
-        
         for pattern in hostname_field_patterns:
             def replace_hostname_field(match):
                 prefix = match.group(1)
                 value = match.group(2)
                 suffix = match.group(3)
                 
-                # Skip if already redacted
-                if value.startswith('[REDACTED'):
-                    return match.group(0)
-                
-                # Skip common non-hostname values
-                if value.lower() in skip_values:
+                if self._should_skip_value(value):
                     return match.group(0)
                 
                 redacted = self._get_or_create_redacted_id(
@@ -500,6 +542,10 @@ class LogRedactor:
             def replace_data_host(match):
                 prefix = match.group(1)
                 value = match.group(2)
+                
+                if self._should_skip_value(value):
+                    return match.group(0)
+                
                 redacted = self._get_or_create_redacted_id(
                     value, self.data_host_mapping, 'DATAHOST'
                 )
@@ -512,6 +558,10 @@ class LogRedactor:
             open_tag = match.group(1)
             value = match.group(2)
             close_tag = match.group(3)
+            
+            if self._should_skip_value(value):
+                return match.group(0)
+            
             redacted = self._get_or_create_redacted_id(
                 value, self.data_host_mapping, 'DATAHOST'
             )
@@ -589,6 +639,11 @@ class LogRedactor:
         
         def replace_hostname(match):
             hostname = match.group(0)
+            
+            # Skip if it's a filename with excluded extension
+            if self._is_excluded_filename(hostname):
+                return hostname
+            
             parts = hostname.lower().split('.')
             if parts[-1] in common_tlds or len(parts) >= 2:
                 return self._get_or_create_redacted_id(hostname, self.hostname_mapping, 'HOST')
@@ -723,6 +778,7 @@ class LogRedactor:
             "# Redacted items: IP addresses, hostnames, GUIDs, emails, MAC addresses,",
             "#                 data-host fields, connection IDs, server name declarations,",
             "#                 key=value hostname patterns, system info, node references",
+            "# Excluded: Configuration files (.conf, .cfg, .yaml, etc.)",
             "# Each unique item is assigned a consistent random identifier.",
             "#" + "=" * 78,
             ""
@@ -887,6 +943,30 @@ class LogRedactor:
         self.mac_mapping.clear()
         self.data_host_mapping.clear()
         self.connection_id_mapping.clear()
+    
+    def add_excluded_extension(self, extension: str) -> None:
+        """
+        Add a file extension to the exclusion list.
+        
+        Args:
+            extension: File extension to exclude (e.g., '.myext')
+        """
+        if not extension.startswith('.'):
+            extension = '.' + extension
+        self.EXCLUDED_FILE_EXTENSIONS.add(extension.lower())
+        self._excluded_extensions_pattern = self._build_excluded_extensions_pattern()
+    
+    def remove_excluded_extension(self, extension: str) -> None:
+        """
+        Remove a file extension from the exclusion list.
+        
+        Args:
+            extension: File extension to remove (e.g., '.conf')
+        """
+        if not extension.startswith('.'):
+            extension = '.' + extension
+        self.EXCLUDED_FILE_EXTENSIONS.discard(extension.lower())
+        self._excluded_extensions_pattern = self._build_excluded_extensions_pattern()
 
 
 def create_sample_log_file(filepath: str) -> None:
@@ -895,34 +975,18 @@ def create_sample_log_file(filepath: str) -> None:
 2024-01-15 10:23:46 DEBUG User session GUID: 550e8400-e29b-41d4-a716-446655440000 started
 2024-01-15 10:23:47 WARN  Failed login attempt from 10.0.0.55 for user admin@internal.corp.net
 2024-01-15 10:23:48 ERROR Database connection failed to db-master.datacenter.local (192.168.1.100)
-2024-01-15 10:23:49 INFO  Request ID: {7C9E6679-7425-40DE-944B-E07FC1F90AE7} processed successfully
-2024-01-15 10:23:50 DEBUG IPv6 connection from 2001:0db8:85a3:0000:0000:8a2e:0370:7334
-2024-01-15 10:23:51 INFO  Backup server backup01.company.com responded with status OK
-2024-01-15 10:23:52 WARN  Multiple requests from 192.168.1.100 detected (possible DDoS)
-2024-01-15 10:24:00 INFO  Email notification sent to john.doe@example.com
-2024-01-15 10:24:01 DEBUG Device MAC: 00:1A:2B:3C:4D:5E connected to network
-2024-01-15 10:24:02 WARN  Unauthorized device AA-BB-CC-DD-EE-FF attempted connection
-2024-01-15 10:26:00 INFO  data-host=production-server-01 received request
-{"datetime":"02-01-2026 18:03:22.663 -0500","log_level":"INFO","component":"DSclient","data":{"guid":"B522CEA3-7295-4E59-B8FF-0B619FBA1847","instanceId":"B522CEA3-7295-4E59-B8FF-0B619FBA1847","ip":"192.168.0.215","dns":"sniffles.localdomain","hostname":"sniffles","mgmt":"8089","build":"e3bdab203ac8","instanceName":"sniffles.localdomain","connectionId":"connection_192.168.0.215_8089_sniffles.localdomain_sniffles_linux-aarch64_B522CEA3-7295-4E59-B8FF-0B619FBA1847_B522CEA3-7295-4E59-B8FF-0B619FBA1847","utsname":"linux-aarch64","splunkVersion":"9.4.1","package":"universal_forwarder","clientId":"B522CEA3-7295-4E59-B8FF-0B619FBA1847","name":"B522CEA3-7295-4E59-B8FF-0B619FBA1847","packageType":"deb","upgradeStatus":"none","upgradeTime":"none"}}
 02-18-2026 16:34:53.513 +0000 INFO  ServerConfig [0 MainThread] - My server name is "sh2".
-02-18-2026 16:34:53.514 +0000 INFO  ServerConfig [0 MainThread] - My host name is "indexer01".
-02-18-2026 16:34:53.515 +0000 INFO  ServerConfig [0 MainThread] - Connected to server "master-node".
-02-18-2026 16:34:53.516 +0000 INFO  ServerConfig [0 MainThread] - Running on host 'web-frontend-03'.
-02-18-2026 16:34:53.517 +0000 INFO  ServerConfig [0 MainThread] - Server: api-backend-01
-02-18-2026 16:34:53.518 +0000 INFO  ServerConfig [0 MainThread] - Connecting to host search-head-02
 02-18-2026 16:35:08.224 +0000 INFO  WorkloadManager [5097 MainThread] - Workload management for splunk node=sh2 with guid=B522CEA3-7295-4E59-B8FF-0B619FBA1847 has been disabled.
-02-18-2026 16:35:08.225 +0000 INFO  ClusterManager [5097 MainThread] - Peer node=indexer01 joined the cluster.
-02-18-2026 16:35:08.226 +0000 INFO  SearchHead [5097 MainThread] - Search dispatched to peer=sh3 with host=search-node-05
-02-18-2026 16:35:08.227 +0000 INFO  Forwarder [5097 MainThread] - Data received from src_host=collector01 target=indexer02
-02-18-2026 16:36:28.079 +0000 WARN  TcpOutputProc [5306 indexerPipe] - The TCP output processor has paused the data flow. Forwarding to host_dest= inside output group group1 from host_src=sh2 has been blocked for blocked_seconds=50.
-02-18-2026 16:36:28.080 +0000 WARN  TcpOutputProc [5306 indexerPipe] - Forwarding to host_dest=indexer03 from host_src=sh2 resumed.
-02-18-2026 16:36:28.081 +0000 INFO  TcpOutputProc [5306 indexerPipe] - Connection established: host_source=forwarder01 host_target=indexer04
-02-18-2026 16:46:35.688 +0000 ERROR SHCRaftConsensus [12602 TcpChannelThread] - Node sh2 is already part of cluster id=B522CEA3-7295-4E59-B8FF-0B619FBA1847. To add a new member via this node use new_member_uri.
-02-18-2026 16:47:49.749 +0000 INFO  SHCMaster [12595 TcpChannelThread] - SHCluster membership generated for nascent: {"event":"add","status":{"captain":{"label":"sh2","id":"B522CEA3-7295-4E59-B8FF-0B619FBA1847"},"peers":{"B522CEA3-7295-4E59-B8FF-0B619FBA1848":{"label":"sh3","status":"Up"}}}}
+02-18-2026 16:35:08.196 +0000 WARN  HTTPAuthManager [5097 MainThread] - pass4SymmKey length is too short. See pass4SymmKey_minLength under the general stanza in server.conf.
+02-18-2026 16:35:08.197 +0000 INFO  ConfigManager [5097 MainThread] - Loading configuration from inputs.conf and outputs.conf
+02-18-2026 16:35:08.198 +0000 DEBUG ConfigManager [5097 MainThread] - Reading props.conf and transforms.conf
+02-18-2026 16:46:35.688 +0000 ERROR SHCRaftConsensus [12602 TcpChannelThread] - Node sh2 is already part of cluster id=B522CEA3-7295-4E59-B8FF-0B619FBA1847.
 02-18-2026 16:54:20.904 +0000 INFO  loader [15153 MainThread] - System info: Linux, sh2, 6.8.0-1033-aws, #35~22.04.1-Ubuntu SMP Wed Jul 23 17:51:00 UTC 2025, x86_64.
 02-18-2026 16:54:20.929 +0000 INFO  LMTracker [15153 MainThread] - init'ing peerId=B522CEA3-7295-4E59-B8FF-0B619FBA1847 label=sh2 [30,30,self]
 02-18-2026 16:46:12.049 +0000 INFO  ServerConfig [12619 AuditSearchExecutor] - Using REMOTE_SERVER_NAME=sh2
-{"server": "webserver01", "host": "dbhost", "nodeName": "worker-node-5", "machineName": "prod-machine-01", "host_src": "source-server", "host_dest": "dest-server", "label": "my-label-host"}
+02-18-2026 16:47:49.749 +0000 INFO  SHCMaster [12595 TcpChannelThread] - SHCluster membership: {"captain":{"label":"sh2","id":"B522CEA3-7295-4E59-B8FF-0B619FBA1847"}}
+02-18-2026 16:55:00.000 +0000 INFO  AppManager [5097 MainThread] - See documentation in README.txt and config.yaml
+02-18-2026 16:55:01.000 +0000 DEBUG ScriptRunner [5097 MainThread] - Executing script.py and helper.sh
 """
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(sample_logs)
