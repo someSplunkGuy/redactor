@@ -1,3 +1,5 @@
+
+<span style="white-space: nowrap;">
 ▗▄▄▖ ▗▄▄▄▖▗▄▄▄  ▗▄▖  ▗▄▄▖▗▄▄▄▖▗▖  ▗▖▗▄▄▄▖
 ▐▌ ▐▌▐▌   ▐▌  █▐▌ ▐▌▐▌     █  ▐▛▚▞▜▌▐▌   
 ▐▛▀▚▖▐▛▀▀▘▐▌  █▐▛▀▜▌▐▌     █  ▐▌  ▐▌▐▛▀▀▘
@@ -59,3 +61,4 @@ Usage:
 python redactme.py <sourceFile> <destinationFile>
 
 Simply tell redactme what to read and where to put the results. Be sure to review your results and report any issues via email so I can add redactions for any unredacted data. 
+</span>
