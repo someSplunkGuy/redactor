@@ -5,7 +5,6 @@
                                          
                                          
 Written by Jeremy Nenadal and Claude Opus 4.5. 
-jnenadal@cisco.com
 
 redactme.py is a script used for redacting log files. You can use this to remove private data from log files within a Splunk diag for collaboration with engineers or safely posting in meeting chats. 
 
@@ -57,6 +56,6 @@ Note that production-server-01 gets the same redacted ID in both occurrences, ma
 +------------------+------------------------------------+
 
 Usage:
-python redactme.py <sourceFile> <destinationFile>
+python redactme.py <sourceFile> -o <destinationFile>
 
-Simply tell redactme what to read and where to put the results. Be sure to review your results and report any issues via email so I can add redactions for any unredacted data. 
+Simply tell redactme what to read and where to put the results. 
