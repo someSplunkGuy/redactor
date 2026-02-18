@@ -1,14 +1,13 @@
-<span style="white-space:nowrap">
 ▗▄▄▖ ▗▄▄▄▖▗▄▄▄  ▗▄▖  ▗▄▄▖▗▄▄▄▖▗▖  ▗▖▗▄▄▄▖
 ▐▌ ▐▌▐▌   ▐▌  █▐▌ ▐▌▐▌     █  ▐▛▚▞▜▌▐▌   
 ▐▛▀▚▖▐▛▀▀▘▐▌  █▐▛▀▜▌▐▌     █  ▐▌  ▐▌▐▛▀▀▘
 ▐▌ ▐▌▐▙▄▄▖▐▙▄▄▀▐▌ ▐▌▝▚▄▄▖  █  ▐▌  ▐▌▐▙▄▄▖
-</span>
-
+                                         
+                                         
 Written by Jeremy Nenadal and Claude Opus 4.5. 
 jnenadal@cisco.com
 
-redactme.py is a script used for redacting log files. You can use this to remove data from Cisco-restricted log files within a Splunk diag for collaboration with engineers or safely posting in meeting chats. 
+redactme.py is a script used for redacting log files. You can use this to remove private data from log files within a Splunk diag for collaboration with engineers or safely posting in meeting chats. 
 
 
 +-------------------------------------------------------------------+----------------------------------+---------------------------------------------------+
