@@ -56,6 +56,6 @@ Note that production-server-01 gets the same redacted ID in both occurrences, ma
 +------------------+------------------------------------+
 
 Usage:
-python redactme.py <sourceFile> -o <destinationFile> 
+python redactme.py sourceFile -o destinationFile
 
 Simply tell redactme what to read and where to put the results. 
