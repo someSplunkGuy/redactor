@@ -1,1137 +1,845 @@
+#!/usr/bin/env python3
+"""
+Log Redactor - Sensitive Information Redaction Tool
+Supports: Splunk logs, etcd logs, metrics logs, and general log formats
+Version: 2.9 (Added Splunk metrics.log support)
+"""
+
 import re
 import random
 import string
 import argparse
 import sys
-from typing import Dict, List, Optional, Set
+from typing import Dict, Set, List, Any
 from pathlib import Path
-from datetime import datetime
+import ipaddress
+import json
 
 
 class LogRedactor:
     """
-    A class to redact sensitive information from log data including:
-    - IP addresses (IPv4 and IPv6)
-    - Hostnames (including simple hostnames in JSON fields and log messages)
-    - GUIDs/UUIDs
-    - Email addresses
-    - MAC addresses
-    - Data-host fields
-    - Connection ID fields
-    - Server name declarations in logs
-    - Key=value hostname patterns (node=, host=, server=, label=, etc.)
-    - System info patterns
-    
-    Each unique item gets a consistent random identifier for tracking.
+    A comprehensive log redaction tool that replaces sensitive information
+    with consistent, trackable redacted identifiers.
     """
     
-    # File extensions that should NOT be redacted (config files, etc.)
+    # File extensions that should not be redacted when appearing as values
     EXCLUDED_FILE_EXTENSIONS: Set[str] = {
-        # Splunk config files
-        '.conf', '.meta', '.spec',
-        # Common config files
-        '.cfg', '.config', '.ini', '.yaml', '.yml', '.json', '.xml',
-        '.properties', '.props', '.toml',
-        # Log files
-        '.log', '.logs',
-        # Script/code files
-        '.py', '.sh', '.bash', '.pl', '.rb', '.js', '.java', '.c', '.cpp',
-        '.h', '.hpp', '.cs', '.go', '.rs', '.php', '.ps1', '.bat', '.cmd',
-        # Data files
-        '.csv', '.tsv', '.txt', '.dat', '.data',
-        # Certificate/key files
-        '.pem', '.crt', '.key', '.cer', '.p12', '.pfx', '.jks',
-        # Archive files
-        '.zip', '.tar', '.gz', '.tgz', '.bz2', '.7z', '.rar',
-        # Document files
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-        # Image files
-        '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico',
-        # Web files
-        '.html', '.htm', '.css', '.scss', '.less',
-        # Other common extensions
-        '.so', '.dll', '.exe', '.bin', '.lib', '.a', '.o',
-        '.pid', '.lock', '.sock', '.socket',
+        '.conf', '.meta', '.spec', '.cfg', '.config', '.ini', '.yaml', '.yml',
+        '.json', '.xml', '.properties', '.log', '.txt', '.csv', '.py', '.java',
+        '.js', '.sh', '.bash', '.zsh', '.ps1', '.bat', '.cmd', '.exe', '.dll',
+        '.so', '.dylib', '.jar', '.war', '.ear', '.class', '.pyc', '.pyo',
+        '.bundle', '.pem', '.crt', '.key', '.cert', '.csr', '.der', '.p12',
+        '.pfx', '.jks', '.keystore', '.truststore', '.go'
     }
     
+    # Patterns that indicate a path/module rather than a hostname
+    LOGGER_PATH_INDICATORS: Set[str] = {
+        'splunk.', 'com.', 'org.', 'net.', 'io.', 'apache.', 'java.', 'javax.',
+        'sun.', 'logging.', 'log4j.', 'slf4j.', 'logback.'
+    }
+    
+    # Go source file patterns (should not be redacted)
+    GO_SOURCE_PATTERNS: Set[str] = {
+        'embed/', 'etcdmain/', 'etcdserver/', 'raft/', 'mvcc/', 'membership/',
+        'transport/', 'api/', 'pkg/', 'cmd/', 'internal/', 'server/', 'client/',
+        'rafthttp/', 'txn/', 'cluster_util', 'traceutil/', 'v3rpc/'
+    }
+    
+    # Data types and keywords that should not be redacted
+    DATA_TYPES_AND_KEYWORDS: Set[str] = {
+        'bool', 'boolean', 'int', 'integer', 'float', 'double', 'string', 'str',
+        'true', 'false', 'null', 'none', 'undefined', 'nan', 'inf', 'infinity',
+        'auto', 'default', 'enabled', 'disabled', 'yes', 'no', 'on', 'off',
+        'existing', 'new', 'zap', 'info', 'debug', 'warn', 'error', 'fatal',
+        'periodic', 'write-only', 'linux', 'amd64', 'arm64', 'darwin', 'windows',
+        'ascend', 'descend', 'create', 'version', 'islearner',
+        # Splunk metrics specific values
+        'none', 'non-clustered', 'clustered', 'instance', 'per_host_agg_cpu',
+        'per_host_thruput', 'per_sourcetype_thruput', 'per_index_thruput',
+        'license_master', 'license_manager', 'search_head', 'indexer',
+        'cluster_master', 'deployment_server', 'shc_member', 'shc_captain'
+    }
+    
+    # JSON keys whose values should NEVER be redacted
+    SKIP_JSON_KEYS: Set[str] = {
+        'ts', 'timestamp', 'time', 'date', 'datetime', 'start', 'end',
+        'start time', 'start_time', 'end time', 'end_time',
+        'caller', 'logger', 'level', 'msg', 'message',
+        'go-version', 'etcd-version', 'git-sha', 'version',
+        'go-os', 'go-arch', 'os', 'arch', 'platform',
+        'data-dir', 'wal-dir', 'member-dir', 'log-outputs',
+        'snapshot-count', 'max-wals', 'max-snapshots',
+        'heartbeat-interval', 'election-timeout', 'publish-timeout',
+        'snapshot-catchup-entries', 'quota-backend-bytes',
+        'max-request-bytes', 'max-concurrent-streams',
+        'compact-check-time-interval', 'auto-compaction-mode',
+        'auto-compaction-retention', 'auto-compaction-interval',
+        'discovery-url', 'discovery-proxy', 'discovery-token',
+        'discovery-dial-timeout', 'discovery-request-timeout',
+        'discovery-keepalive-time', 'discovery-keepalive-timeout',
+        'discovery-cert', 'discovery-key', 'discovery-cacert',
+        'discovery-user', 'discovery-endpoints',
+        'downgrade-check-interval', 'corrupt-check-time-interval',
+        'max-learners', 'v2-deprecation', 'max-cpu-set', 'max-cpu-available',
+        'cors', 'host-whitelist', 'feature-gates', 'pre-vote',
+        'member-initialized', 'force-new-cluster', 'initial-election-tick-advance',
+        'initial-corrupt-check', 'discovery-insecure-transport',
+        'discovery-insecure-skip-tls-verify', 'wal-dir-dedicated',
+        'experimental-local-address', 'took', 'expected-duration',
+        'prefix', 'sort_order', 'sort_target', 'added-peer-is-learner',
+        'duration', 'time spent', 'steps', 'step_count'
+    }
+    
+    # JSON keys that contain hostnames
+    HOSTNAME_JSON_KEYS: Set[str] = {
+        'hostname', 'host', 'nodename', 'node_name', 'server', 'servername',
+        'server_name', 'machine', 'machinename', 'machine_name', 'peer',
+        'data-host', 'host_src', 'host_dest', 'src_host', 'dest_host',
+        'source_host', 'destination_host', 'label', 'name', 'member-name',
+        'local-member-name', 'peer-name'
+    }
+    
+    # JSON keys that contain cluster specifications
+    CLUSTER_SPEC_JSON_KEYS: Set[str] = {
+        'initial-cluster', 'endpoints', 'members', 'cluster'
+    }
+    
+    # JSON keys that contain URLs
+    URL_JSON_KEYS: Set[str] = {
+        'initial-advertise-peer-urls', 'listen-peer-urls',
+        'advertise-client-urls', 'listen-client-urls',
+        'listen-metrics-urls', 'peer-urls', 'client-urls', 'endpoints',
+        'remote-peer-urls', 'added-peer-peer-urls', 'peer-url',
+        'client-url', 'advertise-url', 'address', 'url', 'urls',
+        'target', 'endpoint'
+    }
+    
+    # JSON keys that contain free-form text/structs
+    FREEFORM_TEXT_KEYS: Set[str] = {
+        'error', 'request', 'response', 'key', 'value', 'range_end',
+        'description', 'detail', 'details', 'reason', 'cause',
+        'local-member-attributes', 'member', 'request content',
+        'request_content', 'attributes'
+    }
+    
+    # Key=value patterns in plain text logs that contain hostnames
+    # These are field names where the value should be treated as a hostname
+    HOSTNAME_KV_KEYS: Set[str] = {
+        'server_name', 'servername', 'host', 'hostname', 'node', 'nodename',
+        'node_name', 'peer', 'machine', 'machinename', 'machine_name',
+        'data-host', 'data_host', 'host_src', 'host_dest', 'src_host',
+        'dest_host', 'source_host', 'destination_host', 'label',
+        'series', 'name', 'server', 'target_host', 'remote_host',
+        'local_host', 'peer_host', 'cluster_label', 'member_name'
+    }
+    
+    # Key=value patterns to skip (their values should not be redacted)
+    SKIP_KV_KEYS: Set[str] = {
+        'group', 'instance_roles', 'index_cluster_label', 'index_cluster_status',
+        'license_status', 'instance_guid', 'cpu_time_ms', 'avg_cpu_time_per_event_ms',
+        'bytes', 'event_count', 'kb', 'ev', 'eps', 'kbps', 'status', 'type',
+        'sourcetype', 'source', 'index', 'splunk_server', 'linecount', 'level',
+        'component', 'log_level', 'thread', 'class', 'method', 'file', 'line'
+    }
+    
+    # CLI argument flags that contain hostnames
+    HOSTNAME_CLI_FLAGS: Set[str] = {
+        '--name', '--initial-cluster', '--initial-advertise-peer-urls',
+        '--advertise-client-urls', '--listen-peer-urls', '--listen-client-urls',
+        '--peer-urls', '--client-urls', '--endpoints'
+    }
+    
+    # Flags to skip
+    SKIP_CLI_FLAGS: Set[str] = {
+        '--data-dir', '--log-outputs', '--logger', '--log-level',
+        '--tls-min-version', '--tls-max-version', '--peer-auto-tls', '--auto-tls',
+        '--initial-cluster-state', '--initial-cluster-token'
+    }
+
     def __init__(self, seed: int = None):
-        """
-        Initialize the LogRedactor.
-        
-        Args:
-            seed: Optional seed for reproducible random number generation
-        """
+        """Initialize the redactor with optional seed for reproducible IDs."""
         if seed is not None:
             random.seed(seed)
         
-        # Dictionaries to track unique items and their redacted identifiers
         self.ip_mapping: Dict[str, str] = {}
         self.hostname_mapping: Dict[str, str] = {}
         self.guid_mapping: Dict[str, str] = {}
         self.email_mapping: Dict[str, str] = {}
         self.mac_mapping: Dict[str, str] = {}
-        self.data_host_mapping: Dict[str, str] = {}
-        self.connection_id_mapping: Dict[str, str] = {}
         
-        # Build regex pattern for excluded file extensions
-        self._excluded_extensions_pattern = self._build_excluded_extensions_pattern()
-    
-    def _build_excluded_extensions_pattern(self) -> re.Pattern:
-        """Build a regex pattern to match filenames with excluded extensions."""
-        # Escape dots and join extensions
-        extensions = '|'.join(re.escape(ext) for ext in self.EXCLUDED_FILE_EXTENSIONS)
-        # Match word characters followed by any excluded extension
-        pattern = rf'\b[\w\-\.]+({extensions})\b'
-        return re.compile(pattern, re.IGNORECASE)
-    
-    def _is_excluded_filename(self, value: str) -> bool:
-        """
-        Check if a value looks like a filename with an excluded extension.
-        
-        Args:
-            value: The value to check
-            
-        Returns:
-            True if it appears to be a filename that should not be redacted
-        """
-        value_lower = value.lower()
-        
-        # Check if it ends with any excluded extension
-        for ext in self.EXCLUDED_FILE_EXTENSIONS:
-            if value_lower.endswith(ext):
-                return True
-        
-        return False
-    
+        self.stats = {
+            'ips': 0,
+            'hostnames': 0,
+            'guids': 0,
+            'emails': 0,
+            'macs': 0,
+            'lines_processed': 0
+        }
+
     def _generate_random_id(self) -> str:
         """Generate a random 6-digit identifier."""
         return ''.join(random.choices(string.digits, k=6))
-    
-    def _get_or_create_redacted_id(self, value: str, mapping: Dict[str, str], 
-                                    prefix: str) -> str:
-        """
-        Get existing redacted ID or create a new one for the given value.
-        """
+
+    def _get_or_create_redacted_id(
+        self, 
+        value: str, 
+        mapping: Dict[str, str], 
+        prefix: str
+    ) -> str:
+        """Get existing or create new redacted ID for a value."""
         value_lower = value.lower()
-        
         if value_lower not in mapping:
             random_id = self._generate_random_id()
             mapping[value_lower] = f"[REDACTED-{prefix}-{random_id}]"
-        
-        return mapping[value_lower]
-    
-    def _should_skip_value(self, value: str, additional_skip_values: Set[str] = None) -> bool:
-        """
-        Check if a value should be skipped from redaction.
-        
-        Args:
-            value: The value to check
-            additional_skip_values: Additional values to skip
             
-        Returns:
-            True if the value should not be redacted
-        """
-        if not value or value.strip() == '':
+            stat_key = {
+                'HOST': 'hostnames', 'IP': 'ips', 'GUID': 'guids',
+                'EMAIL': 'emails', 'MAC': 'macs'
+            }.get(prefix)
+            if stat_key:
+                self.stats[stat_key] += 1
+                
+        return mapping[value_lower]
+
+    # =========================================================================
+    # VALIDATION AND EXCLUSION METHODS
+    # =========================================================================
+
+    def _is_excluded_filename(self, value: str) -> bool:
+        """Check if value appears to be a configuration filename."""
+        value_lower = value.lower()
+        return any(value_lower.endswith(ext) for ext in self.EXCLUDED_FILE_EXTENSIONS)
+
+    def _is_go_source_reference(self, value: str) -> bool:
+        """Check if value is a Go source file reference."""
+        if re.match(r'^[a-zA-Z0-9_/]+\.go(:\d+)?$', value):
+            return True
+        return any(value.startswith(prefix) for prefix in self.GO_SOURCE_PATTERNS)
+
+    def _is_logger_or_module_path(self, value: str) -> bool:
+        """Check if value appears to be a logger/module path."""
+        value_lower = value.lower()
+        
+        if any(indicator in value_lower for indicator in self.LOGGER_PATH_INDICATORS):
             return True
         
-        # Skip if already redacted
-        if value.startswith('[REDACTED'):
-            return True
-        
-        # Skip if it's a filename with excluded extension
-        if self._is_excluded_filename(value):
-            return True
-        
-        # Skip if it's a number
-        if value.isdigit():
-            return True
-        
-        # Skip if it starts with a path separator
-        if value.startswith('/') or value.startswith('\\'):
-            return True
-        
-        # Default skip values
-        default_skip_values = {
-            'localhost', 'null', 'none', 'unknown', 'n/a', 'undefined',
-            'true', 'false', 'yes', 'no', 'ok', 'error', 'success',
-            'failed', 'failure', 'complete', 'completed', 'pending',
-            'enabled', 'disabled', 'active', 'inactive', 'on', 'off',
-            '0', '1', '-', '*', 'any', 'all', 'local', 'default',
-            'up', 'down', 'self',
-        }
-        
-        if additional_skip_values:
-            default_skip_values.update(additional_skip_values)
-        
-        if value.lower() in default_skip_values:
+        if self._is_go_source_reference(value):
             return True
         
         return False
-    
-    def _redact_system_info(self, text: str) -> str:
-        """
-        Redact system info patterns that contain hostnames.
-        """
-        # Pattern for "System info: OS, hostname, kernel, ..."
-        system_info_pattern = r'(System\s+info:\s*\w+,\s*)([^,\s]+)(,)'
+
+    def _is_data_type_or_keyword(self, value: str) -> bool:
+        """Check if value is a data type or common keyword."""
+        return value.lower() in self.DATA_TYPES_AND_KEYWORDS
+
+    def _is_version_string(self, value: str) -> bool:
+        """Check if value appears to be a version string."""
+        if re.match(r'^v?\d+\.\d+(\.\d+)*(-[a-zA-Z0-9]+)?$', value):
+            return True
+        if re.match(r'^go\d+\.\d+(\.\d+)?$', value):
+            return True
+        return False
+
+    def _is_timestamp_component(self, value: str) -> bool:
+        """Check if value appears to be part of a timestamp."""
+        if re.match(r'^\d{2}\.\d+$', value):
+            return True
+        if re.match(r'^\d{1,2}:\d{2}(:\d{2})?(\.\d+)?$', value):
+            return True
+        if re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', value):
+            return True
+        return False
+
+    def _is_reserved_ip(self, ip_str: str) -> bool:
+        """Check if IP is loopback or reserved."""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            return ip.is_loopback or ip.is_reserved or ip.is_unspecified
+        except ValueError:
+            return False
+
+    def _is_hex_id(self, value: str) -> bool:
+        """Check if value is a hex identifier."""
+        return bool(re.match(r'^[0-9a-fA-F]{16}$', value))
+
+    def _is_trace_id(self, value: str) -> bool:
+        """Check if value is a trace ID."""
+        return bool(re.match(r'^trace\[\d+\]', value))
+
+    def _is_numeric_value(self, value: str) -> bool:
+        """Check if value is purely numeric (possibly with decimal)."""
+        return bool(re.match(r'^-?\d+(\.\d+)?$', value))
+
+    def _is_valid_hostname(self, value: str) -> bool:
+        """Validate if a string could be a valid hostname."""
+        if not value or len(value) > 253:
+            return False
         
-        def replace_system_info(match):
-            prefix = match.group(1)
-            hostname = match.group(2)
-            suffix = match.group(3)
+        # Must not be purely numeric
+        if self._is_numeric_value(value):
+            return False
+        
+        if value.replace('.', '').replace('-', '').replace('_', '').isdigit():
+            return False
+        
+        # Must start with alphanumeric
+        if not value[0].isalnum():
+            return False
+        
+        # Must not be a hex ID or trace ID
+        if self._is_hex_id(value) or self._is_trace_id(value):
+            return False
+        
+        # Must not be a keyword
+        if self._is_data_type_or_keyword(value):
+            return False
+        
+        # FQDN pattern (dots)
+        if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9-]*(\.[a-zA-Z0-9][a-zA-Z0-9-]*)+$', value):
+            return True
+        
+        # Cloud hostname with underscores
+        if re.match(r'^[a-zA-Z0-9]+([_-][a-zA-Z0-9-]+)+$', value):
+            return True
+        
+        # Simple short hostname (letters + optional digits, like sh2, web01)
+        if re.match(r'^[a-zA-Z]+[a-zA-Z0-9-]*\d*$', value) and len(value) >= 2:
+            return True
+        
+        return False
+
+    def _should_skip_value(self, value: str, context_key: str = None) -> bool:
+        """Determine if a value should be skipped from redaction."""
+        if not value or not value.strip():
+            return True
+        
+        if value.startswith('[REDACTED'):
+            return True
+        
+        if context_key and context_key.lower() in self.SKIP_JSON_KEYS:
+            return True
+        
+        if self._is_excluded_filename(value):
+            return True
+        if self._is_data_type_or_keyword(value):
+            return True
+        if self._is_version_string(value):
+            return True
+        if self._is_timestamp_component(value):
+            return True
+        if self._is_go_source_reference(value):
+            return True
+        if self._is_hex_id(value):
+            return True
+        if self._is_numeric_value(value):
+            return True
+        
+        return False
+
+    def _redact_hostname(self, hostname: str, context_key: str = None) -> str:
+        """Redact a single hostname value."""
+        if self._should_skip_value(hostname, context_key):
+            return hostname
+        if not self._is_valid_hostname(hostname):
+            return hostname
+        return self._get_or_create_redacted_id(hostname, self.hostname_mapping, 'HOST')
+
+    # =========================================================================
+    # URL AND CLUSTER SPEC REDACTION
+    # =========================================================================
+
+    def _redact_url(self, url: str) -> str:
+        """Redact hostname/IP within a URL."""
+        if not url or not isinstance(url, str):
+            return url
+        
+        url_pattern = r'(https?://)([^:/\s\]\[",\\]+)(:\d+)?([^\s\]\[",\\]*)?'
+        
+        def replace_url(match):
+            protocol = match.group(1)
+            host = match.group(2)
+            port = match.group(3) or ''
+            path = match.group(4) or ''
             
-            if self._should_skip_value(hostname):
+            if self._is_reserved_ip(host):
                 return match.group(0)
             
-            # Skip if it looks like a kernel version or number
-            if re.match(r'^[\d\.\-]+', hostname):
-                return match.group(0)
-            
-            redacted = self._get_or_create_redacted_id(
-                hostname, self.hostname_mapping, 'HOST'
-            )
-            return f"{prefix}{redacted}{suffix}"
-        
-        result = re.sub(system_info_pattern, replace_system_info, text, flags=re.IGNORECASE)
-        
-        # Pattern for uname output: "Linux hostname kernel..."
-        uname_pattern = r'(uname:\s*Linux\s+)([^\s]+)(\s+[\d\.])'
-        
-        def replace_uname(match):
-            prefix = match.group(1)
-            hostname = match.group(2)
-            suffix = match.group(3)
-            
-            if self._should_skip_value(hostname):
-                return match.group(0)
-            
-            redacted = self._get_or_create_redacted_id(
-                hostname, self.hostname_mapping, 'HOST'
-            )
-            return f"{prefix}{redacted}{suffix}"
-        
-        result = re.sub(uname_pattern, replace_uname, result, flags=re.IGNORECASE)
-        
-        return result
-    
-    def _redact_node_references(self, text: str) -> str:
-        """
-        Redact node/member references in log messages.
-        """
-        patterns = [
-            # "Node hostname is/has/joined/etc"
-            (r'(Node\s+)([^\s]+)(\s+(?:is|has|joined|left|added|removed|elected|became|was))', 1, 2, 3),
-            # "member hostname"
-            (r'(member\s+)([^\s,;\]\}"\']+)', 1, 2, None),
-            # "peer hostname" (when not followed by =)
-            (r'(peer\s+)(?!=)([^\s,;\]\}"\']+)', 1, 2, None),
-            # "captain hostname"
-            (r'(captain\s+)(?!=)([^\s,;\]\}"\']+)', 1, 2, None),
-        ]
-        
-        result = text
-        
-        additional_skip = {'is', 'has', 'was', 'been', 'the', 'and', 'for', 'to', 'from',
-                          'id', 'uri', 'url', 'status', 'info', 'data', 'with'}
-        
-        for pattern_tuple in patterns:
-            if len(pattern_tuple) == 4:
-                pattern, g1, g2, g3 = pattern_tuple
-                
-                def make_replacer(grp1, grp2, grp3):
-                    def replace_func(match):
-                        prefix = match.group(grp1)
-                        hostname = match.group(grp2)
-                        suffix = match.group(grp3) if grp3 else ''
-                        
-                        if self._should_skip_value(hostname, additional_skip):
-                            return match.group(0)
-                        
-                        redacted = self._get_or_create_redacted_id(
-                            hostname, self.hostname_mapping, 'HOST'
-                        )
-                        return f"{prefix}{redacted}{suffix}"
-                    return replace_func
-                
-                result = re.sub(pattern, make_replacer(g1, g2, g3), result, flags=re.IGNORECASE)
+            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host):
+                redacted_host = self._get_or_create_redacted_id(host, self.ip_mapping, 'IP')
             else:
-                pattern, g1, g2, _ = pattern_tuple
+                redacted_host = self._redact_hostname(host)
+            
+            return f"{protocol}{redacted_host}{port}{path}"
+        
+        return re.sub(url_pattern, replace_url, url)
+
+    def _redact_cluster_spec(self, spec: str) -> str:
+        """Redact hostnames in cluster specifications."""
+        if not spec or not isinstance(spec, str):
+            return spec
+        
+        entries = spec.split(',')
+        redacted_entries = []
+        
+        for entry in entries:
+            entry = entry.strip()
+            if '=' in entry and '://' in entry:
+                eq_pos = entry.index('=')
+                hostname_part = entry[:eq_pos]
+                url_part = entry[eq_pos + 1:]
                 
-                def make_replacer2(grp1, grp2):
-                    def replace_func(match):
-                        prefix = match.group(grp1)
-                        hostname = match.group(grp2)
-                        
-                        if self._should_skip_value(hostname, additional_skip):
-                            return match.group(0)
-                        
-                        redacted = self._get_or_create_redacted_id(
-                            hostname, self.hostname_mapping, 'HOST'
-                        )
-                        return f"{prefix}{redacted}"
-                    return replace_func
+                redacted_hostname = self._redact_hostname(hostname_part)
+                redacted_url = self._redact_url(url_part) if url_part else ''
                 
-                result = re.sub(pattern, make_replacer2(g1, g2), result, flags=re.IGNORECASE)
+                redacted_entries.append(f"{redacted_hostname}={redacted_url}")
+            elif '://' in entry:
+                redacted_entries.append(self._redact_url(entry))
+            else:
+                redacted_entries.append(entry)
+        
+        return ','.join(redacted_entries)
+
+    # =========================================================================
+    # STRUCT/ATTRIBUTE STRING REDACTION
+    # =========================================================================
+
+    def _redact_struct_string(self, text: str) -> str:
+        """Redact hostnames in Go-style struct strings."""
+        if not text or not isinstance(text, str):
+            return text
+        
+        result = text
+        
+        # 1. Redact Name:hostname pattern
+        result = re.sub(
+            r'(Name:)([^\s,}\]\[]+)',
+            lambda m: f"{m.group(1)}{self._redact_hostname(m.group(2))}" 
+                      if not m.group(2).startswith('http') else m.group(0),
+            result
+        )
+        
+        # 2. Redact URLs in ClientURLs:[...] and PeerURLs:[...]
+        result = re.sub(
+            r'((?:Client|Peer)URLs:\[)([^\]]+)(\])',
+            lambda m: f"{m.group(1)}{self._redact_url(m.group(2))}{m.group(3)}",
+            result
+        )
+        
+        # 3. Redact range_begin:/path/hostname and range_end:/path/hostname
+        result = re.sub(
+            r'(range_(?:begin|end):)(/[^/]+/)([^;}\s]+)',
+            lambda m: f"{m.group(1)}{m.group(2)}{self._redact_hostname(m.group(3))}",
+            result
+        )
+        
+        # 4. Redact key:"/path/hostname" patterns
+        result = re.sub(
+            r'(key:\s*\\?")(/[^/]+/)([^"\\]+)(\\?")',
+            lambda m: f'{m.group(1)}{m.group(2)}{self._redact_hostname(m.group(3))}{m.group(4)}',
+            result
+        )
+        
+        # 5. Redact range_end:"/path/hostname" patterns  
+        result = re.sub(
+            r'(range_end:\s*\\?")(/[^/]+/)([^"\\]+)(\\?")',
+            lambda m: f'{m.group(1)}{m.group(2)}{self._redact_hostname(m.group(3))}{m.group(4)}',
+            result
+        )
+        
+        # 6. Redact any remaining URLs
+        result = self._redact_url(result)
+        
+        # 7. Redact IPs in "dial tcp IP:port" patterns
+        result = re.sub(
+            r'(dial\s+tcp\s+)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?',
+            lambda m: f"{m.group(1)}{self._get_or_create_redacted_id(m.group(2), self.ip_mapping, 'IP')}{m.group(3) or ''}"
+                      if not self._is_reserved_ip(m.group(2)) else m.group(0),
+            result
+        )
         
         return result
-    
-    def _redact_key_value_hostnames(self, text: str) -> str:
+
+    def _redact_freeform_text(self, text: str) -> str:
+        """Redact hostnames and IPs in free-form text fields."""
+        if not text or not isinstance(text, str):
+            return text
+        
+        return self._redact_struct_string(text)
+
+    # =========================================================================
+    # SPLUNK METRICS LOG REDACTION
+    # =========================================================================
+
+    def _redact_splunk_metrics_line(self, line: str) -> str:
         """
-        Redact hostname values in key=value patterns.
+        Redact hostnames in Splunk metrics.log format.
+        Format: key=value, key="value", key=value
         """
-        # Keys that typically contain hostnames (order matters - longer keys first)
-        hostname_keys = [
-            # Splunk-specific compound keys
-            'REMOTE_SERVER_NAME', 'LOCAL_SERVER_NAME', 'SERVER_NAME',
-            'SPLUNK_SERVER_NAME', 'CLUSTER_MASTER', 'SEARCH_HEAD',
-            'DEPLOYER', 'LICENSE_MASTER', 'INDEXER_CLUSTER_MASTER',
-            # Compound keys with underscores (longer patterns first)
-            'host_dest', 'host_src', 'host_source', 'host_target', 'host_origin',
-            'src_host', 'dst_host', 'dest_host', 'source_host', 'target_host',
-            'remote_host', 'local_host', 'orig_host', 'hostname_orig',
-            'splunk_server', 'search_head', 'server_name', 'host_name',
-            'node_name', 'machine_name', 'computer_name',
-            # Compound keys without underscores
-            'srchost', 'dsthost', 'desthost', 'sourcehost', 'targethost',
-            'remotehost', 'orighost', 'localhost_name', 'peerId',
-            # CamelCase variants
-            'hostDest', 'hostSrc', 'hostSource', 'hostTarget',
-            'srcHost', 'dstHost', 'destHost', 'sourceHost', 'targetHost',
-            'remoteHost', 'localHost', 'origHost', 'serverName', 'hostName',
-            'nodeName', 'machineName', 'computerName', 'peerName',
-            # Simple keys
-            'node', 'host', 'server', 'hostname', 'machine', 'computer',
-            'src', 'dst', 'dest', 'source', 'target', 'origin', 'destination',
-            'client', 'peer', 'remote', 'worker', 'instance', 'label',
-            'primary', 'secondary', 'master', 'slave', 'replica',
-            'indexer', 'forwarder', 'captain', 'member',
-            'servername', 'nodename', 'machinename', 'computername',
-        ]
+        result = line
         
-        # Build pattern to match any of these keys
-        keys_pattern = '|'.join(re.escape(key) for key in hostname_keys)
+        # Build pattern for hostname keys
+        hostname_keys_pattern = '|'.join(re.escape(k) for k in self.HOSTNAME_KV_KEYS)
         
-        # Pattern: key=value (with optional quotes)
-        pattern = rf'\b({keys_pattern})\s*=\s*(["\']?)([^"\'\s,;\]\}}\)\[]+)\2'
+        # Pattern 1: key=value (unquoted, followed by comma, space, or end)
+        # Matches: server_name=sh2, series=sh2
+        pattern_unquoted = rf'\b({hostname_keys_pattern})=([^,\s"]+)'
         
-        def replace_kv_hostname(match):
+        def replace_unquoted(match):
             key = match.group(1)
-            quote = match.group(2)
-            value = match.group(3)
-            
-            if self._should_skip_value(value):
-                return match.group(0)
-            
-            redacted = self._get_or_create_redacted_id(
-                value, self.hostname_mapping, 'HOST'
-            )
-            return f"{key}={quote}{redacted}{quote}"
-        
-        return re.sub(pattern, replace_kv_hostname, text, flags=re.IGNORECASE)
-    
-    def _redact_server_name_declarations(self, text: str) -> str:
-        """
-        Redact server/host name declarations in log messages.
-        """
-        patterns = [
-            # "My server name is" patterns
-            (r'((?:My\s+)?server\s+name\s+is\s+)["\']([^"\']+)["\']', 2),
-            (r'((?:My\s+)?server\s+name\s+is\s+)([^\s,;\]\}"\'\.]+)', 2),
-            
-            # "My host name is" patterns  
-            (r'((?:My\s+)?host\s*name\s+is\s+)["\']([^"\']+)["\']', 2),
-            (r'((?:My\s+)?host\s*name\s+is\s+)([^\s,;\]\}"\'\.]+)', 2),
-            
-            # "hostname is" patterns
-            (r'(hostname\s+is\s+)["\']([^"\']+)["\']', 2),
-            (r'(hostname\s+is\s+)([^\s,;\]\}"\'\.]+)', 2),
-            
-            # "Server:" or "Host:" patterns
-            (r'((?:Server|Host)\s*:\s*)["\']([^"\']+)["\']', 2),
-            (r'((?:Server|Host)\s*:\s*)([^\s,;\]\}"\']+)', 2),
-            
-            # "Connected to server" patterns
-            (r'((?:Connected|Connecting)\s+to\s+(?:server|host)\s+)["\']([^"\']+)["\']', 2),
-            (r'((?:Connected|Connecting)\s+to\s+(?:server|host)\s+)([^\s,;\]\}"\']+)', 2),
-            
-            # "Running on host" patterns
-            (r'(Running\s+on\s+(?:server|host)\s+)["\']([^"\']+)["\']', 2),
-            (r'(Running\s+on\s+(?:server|host)\s+)([^\s,;\]\}"\']+)', 2),
-            
-            # "from server/host" patterns
-            (r'(from\s+(?:server|host)\s+)["\']([^"\']+)["\']', 2),
-            (r'(from\s+(?:server|host)\s+)([^\s,;\]\}"\']+)', 2),
-            
-            # "to server/host" patterns
-            (r'(to\s+(?:server|host)\s+)["\']([^"\']+)["\']', 2),
-            (r'(to\s+(?:server|host)\s+)([^\s,;\]\}"\']+)', 2),
-            
-            # "on server/host" patterns
-            (r'(on\s+(?:server|host)\s+)["\']([^"\']+)["\']', 2),
-            (r'(on\s+(?:server|host)\s+)([^\s,;\]\}"\']+)', 2),
-            
-            # "node name is" patterns
-            (r'((?:My\s+)?node\s*name\s+is\s+)["\']([^"\']+)["\']', 2),
-            (r'((?:My\s+)?node\s*name\s+is\s+)([^\s,;\]\}"\'\.]+)', 2),
-            
-            # "machine name is" patterns
-            (r'((?:My\s+)?machine\s*name\s+is\s+)["\']([^"\']+)["\']', 2),
-            (r'((?:My\s+)?machine\s*name\s+is\s+)([^\s,;\]\}"\'\.]+)', 2),
-            
-            # "for splunk node" patterns (Splunk-specific)
-            (r'(for\s+splunk\s+node\s*[=:]?\s*)["\']?([^\s,;\]\}"\']+)["\']?', 2),
-            
-            # "splunk node" patterns
-            (r'(splunk\s+node\s*[=:]?\s*)["\']?([^\s,;\]\}"\']+)["\']?', 2),
-            
-            # "Forwarding to" patterns (Splunk-specific)
-            (r'(Forwarding\s+to\s+)["\']?([^\s,;\]\}"\']+)["\']?', 2),
-            
-            # "Using REMOTE_SERVER_NAME=" pattern
-            (r'(Using\s+\w+\s*=\s*)([^\s,;\]\}"\']+)', 2),
-            
-            # "in <filename>" patterns - need to exclude config files
-            (r'((?:in|from|see|refer\s+to)\s+)([^\s,;\]\}"\']+)', 2),
-        ]
-        
-        result = text
-        
-        additional_skip = {'with', 'has', 'been', 'the', 'and', 'for', 'inside'}
-        
-        for pattern, value_group in patterns:
-            def make_replacer(val_group):
-                def replace_func(match):
-                    prefix = match.group(1)
-                    value = match.group(val_group)
-                    
-                    if self._should_skip_value(value, additional_skip):
-                        return match.group(0)
-                    
-                    redacted = self._get_or_create_redacted_id(
-                        value, self.hostname_mapping, 'HOST'
-                    )
-                    return f"{prefix}{redacted}"
-                return replace_func
-            
-            result = re.sub(pattern, make_replacer(value_group), result, flags=re.IGNORECASE)
-        
-        return result
-    
-    def _redact_connection_id(self, text: str) -> str:
-        """
-        Redact connectionId fields which contain embedded sensitive data.
-        """
-        connection_id_pattern = r'("connectionId"\s*:\s*")([^"]+)(")'
-        
-        def replace_connection_id(match):
-            prefix = match.group(1)
-            value = match.group(2)
-            suffix = match.group(3)
-            
-            if self._should_skip_value(value):
-                return match.group(0)
-            
-            redacted = self._get_or_create_redacted_id(
-                value, self.connection_id_mapping, 'CONNID'
-            )
-            return f"{prefix}{redacted}{suffix}"
-        
-        result = re.sub(connection_id_pattern, replace_connection_id, text, flags=re.IGNORECASE)
-        
-        connection_id_pattern2 = r'(connectionId\s*[=:]\s*)([^\s,;\]\}"\']+)'
-        
-        def replace_connection_id2(match):
-            prefix = match.group(1)
             value = match.group(2)
             
-            if self._should_skip_value(value):
+            # Skip if value is a keyword or not a valid hostname
+            if self._should_skip_value(value, key):
+                return match.group(0)
+            if not self._is_valid_hostname(value):
                 return match.group(0)
             
-            redacted = self._get_or_create_redacted_id(
-                value, self.connection_id_mapping, 'CONNID'
-            )
-            return f"{prefix}{redacted}"
+            redacted = self._get_or_create_redacted_id(value, self.hostname_mapping, 'HOST')
+            return f'{key}={redacted}'
         
-        result = re.sub(connection_id_pattern2, replace_connection_id2, result, flags=re.IGNORECASE)
+        result = re.sub(pattern_unquoted, replace_unquoted, result, flags=re.IGNORECASE)
         
-        return result
-    
-    def _redact_json_hostname_fields(self, text: str) -> str:
-        """
-        Redact hostname values in JSON fields.
-        """
-        hostname_field_patterns = [
-            r'("hostname"\s*:\s*")([^"]+)(")',
-            r'("hostName"\s*:\s*")([^"]+)(")',
-            r'("host_name"\s*:\s*")([^"]+)(")',
-            r'("host"\s*:\s*")([^"]+)(")',
-            r'("server"\s*:\s*")([^"]+)(")',
-            r'("serverName"\s*:\s*")([^"]+)(")',
-            r'("server_name"\s*:\s*")([^"]+)(")',
-            r'("machineName"\s*:\s*")([^"]+)(")',
-            r'("machine_name"\s*:\s*")([^"]+)(")',
-            r'("nodeName"\s*:\s*")([^"]+)(")',
-            r'("node_name"\s*:\s*")([^"]+)(")',
-            r'("node"\s*:\s*")([^"]+)(")',
-            r'("computerName"\s*:\s*")([^"]+)(")',
-            r'("computer_name"\s*:\s*")([^"]+)(")',
-            r'("deviceName"\s*:\s*")([^"]+)(")',
-            r'("device_name"\s*:\s*")([^"]+)(")',
-            r'("workerName"\s*:\s*")([^"]+)(")',
-            r'("worker_name"\s*:\s*")([^"]+)(")',
-            r'("srcHost"\s*:\s*")([^"]+)(")',
-            r'("src_host"\s*:\s*")([^"]+)(")',
-            r'("dstHost"\s*:\s*")([^"]+)(")',
-            r'("dst_host"\s*:\s*")([^"]+)(")',
-            r'("destHost"\s*:\s*")([^"]+)(")',
-            r'("dest_host"\s*:\s*")([^"]+)(")',
-            r'("sourceHost"\s*:\s*")([^"]+)(")',
-            r'("source_host"\s*:\s*")([^"]+)(")',
-            r'("targetHost"\s*:\s*")([^"]+)(")',
-            r'("target_host"\s*:\s*")([^"]+)(")',
-            r'("host_src"\s*:\s*")([^"]+)(")',
-            r'("host_dest"\s*:\s*")([^"]+)(")',
-            r'("hostSrc"\s*:\s*")([^"]+)(")',
-            r'("hostDest"\s*:\s*")([^"]+)(")',
-            r'("peer"\s*:\s*")([^"]+)(")',
-            r'("instance"\s*:\s*")([^"]+)(")',
-            r'("label"\s*:\s*")([^"]+)(")',
-            r'("captain"\s*:\s*")([^"]+)(")',
-            r'("member"\s*:\s*")([^"]+)(")',
-            r'("master"\s*:\s*")([^"]+)(")',
-            r'("slave"\s*:\s*")([^"]+)(")',
-            r'("primary"\s*:\s*")([^"]+)(")',
-            r'("secondary"\s*:\s*")([^"]+)(")',
-        ]
+        # Pattern 2: key="value" (quoted)
+        # Matches: server_name="sh2", series="sh2"
+        pattern_quoted = rf'\b({hostname_keys_pattern})="([^"]+)"'
         
-        result = text
-        
-        for pattern in hostname_field_patterns:
-            def replace_hostname_field(match):
-                prefix = match.group(1)
-                value = match.group(2)
-                suffix = match.group(3)
-                
-                if self._should_skip_value(value):
-                    return match.group(0)
-                
-                redacted = self._get_or_create_redacted_id(
-                    value, self.hostname_mapping, 'HOST'
-                )
-                return f"{prefix}{redacted}{suffix}"
-            
-            result = re.sub(pattern, replace_hostname_field, result, flags=re.IGNORECASE)
-        
-        return result
-    
-    def _redact_data_host(self, text: str) -> str:
-        """
-        Redact data-host field values in various formats.
-        """
-        patterns = [
-            r'(data[-_]?host\s*[=:]\s*)["\']?([^"\'\s,;\]\}]+)["\']?',
-            r'(["\']data[-_]?host["\']\s*:\s*)["\']([^"\']+)["\']',
-            r'((?:data|Data)Host\s*[=:]\s*)["\']?([^"\'\s,;\]\}]+)["\']?',
-            r'(data[-_]?host\s+)([^\s,;\]\}]+)',
-            r'(<data[-_]?host>)([^<]+)(</data[-_]?host>)',
-        ]
-        
-        result = text
-        
-        for pattern in patterns[:-1]:
-            def replace_data_host(match):
-                prefix = match.group(1)
-                value = match.group(2)
-                
-                if self._should_skip_value(value):
-                    return match.group(0)
-                
-                redacted = self._get_or_create_redacted_id(
-                    value, self.data_host_mapping, 'DATAHOST'
-                )
-                return f"{prefix}{redacted}"
-            
-            result = re.sub(pattern, replace_data_host, result, flags=re.IGNORECASE)
-        
-        xml_pattern = patterns[-1]
-        def replace_xml_data_host(match):
-            open_tag = match.group(1)
+        def replace_quoted(match):
+            key = match.group(1)
             value = match.group(2)
-            close_tag = match.group(3)
             
-            if self._should_skip_value(value):
+            if self._should_skip_value(value, key):
+                return match.group(0)
+            if not self._is_valid_hostname(value):
                 return match.group(0)
             
-            redacted = self._get_or_create_redacted_id(
-                value, self.data_host_mapping, 'DATAHOST'
-            )
-            return f"{open_tag}{redacted}{close_tag}"
+            redacted = self._get_or_create_redacted_id(value, self.hostname_mapping, 'HOST')
+            return f'{key}="{redacted}"'
         
-        result = re.sub(xml_pattern, replace_xml_data_host, result, flags=re.IGNORECASE)
+        result = re.sub(pattern_quoted, replace_quoted, result, flags=re.IGNORECASE)
         
         return result
-    
-    def _redact_emails(self, text: str) -> str:
-        """Redact email addresses."""
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+
+    def _is_splunk_metrics_line(self, line: str) -> bool:
+        """Check if line is a Splunk metrics.log format."""
+        # Typical pattern: timestamp INFO Metrics - group=xxx, name=xxx
+        return bool(re.search(r'\b(INFO|WARN|ERROR)\s+Metrics\s+-\s+group=', line))
+
+    # =========================================================================
+    # JSON-AWARE REDACTION METHODS
+    # =========================================================================
+
+    def _redact_json_object(self, obj: Any, parent_key: str = None) -> Any:
+        """Recursively redact sensitive values in a JSON object."""
+        if isinstance(obj, dict):
+            result = {}
+            for key, value in obj.items():
+                result[key] = self._redact_json_value(key, value)
+            return result
+        elif isinstance(obj, list):
+            return [self._redact_json_object(item, parent_key) for item in obj]
+        else:
+            return obj
+
+    def _redact_json_value(self, key: str, value: Any) -> Any:
+        """Redact a JSON value based on its key."""
+        key_lower = key.lower()
         
-        def replace_email(match):
-            email = match.group(0)
-            return self._get_or_create_redacted_id(email, self.email_mapping, 'EMAIL')
+        if key_lower in self.SKIP_JSON_KEYS:
+            return value
         
-        return re.sub(email_pattern, replace_email, text)
-    
-    def _redact_mac_addresses(self, text: str) -> str:
-        """Redact MAC addresses in various formats."""
-        mac_patterns = [
-            r'\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b',
-            r'\b(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b',
-            r'\b(?:[0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}\b',
-        ]
+        if isinstance(value, dict):
+            return self._redact_json_object(value, key)
         
-        def replace_mac(match):
-            mac = match.group(0)
-            return self._get_or_create_redacted_id(mac, self.mac_mapping, 'MAC')
+        elif isinstance(value, list):
+            if key_lower in self.URL_JSON_KEYS or key_lower.endswith('-urls') or key_lower.endswith('urls'):
+                return [self._redact_url(item) if isinstance(item, str) else item 
+                        for item in value]
+            else:
+                return [self._redact_json_object(item, key) for item in value]
         
-        result = text
-        for pattern in mac_patterns:
-            result = re.sub(pattern, replace_mac, result, flags=re.IGNORECASE)
+        elif isinstance(value, str):
+            if key_lower in self.CLUSTER_SPEC_JSON_KEYS:
+                if '=' in value and '://' in value:
+                    return self._redact_cluster_spec(value)
+            
+            if key_lower in self.HOSTNAME_JSON_KEYS:
+                return self._redact_hostname(value, key)
+            
+            if key_lower in self.URL_JSON_KEYS or key_lower.endswith('-urls') or key_lower.endswith('-url'):
+                return self._redact_url(value)
+            
+            if key_lower in self.FREEFORM_TEXT_KEYS:
+                return self._redact_freeform_text(value)
+            
+            if '://' in value:
+                return self._redact_url(value)
+            
+            if value.startswith('{') and ('Name:' in value or 'range_' in value or 'ClientURLs:' in value):
+                return self._redact_struct_string(value)
+            
+            if re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', value):
+                return self._get_or_create_redacted_id(value, self.guid_mapping, 'GUID')
+            
+            if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', value):
+                return self._get_or_create_redacted_id(value, self.email_mapping, 'EMAIL')
+            
+            return value
         
-        return result
-    
-    def _redact_ipv4(self, text: str) -> str:
-        """Redact IPv4 addresses, including those embedded in strings."""
-        ipv4_pattern = r'(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)'
+        else:
+            return value
+
+    def _redact_etcd_args_array(self, args_list: List) -> List:
+        """Redact hostnames within etcd args arrays."""
+        redacted_args = []
+        i = 0
+        
+        while i < len(args_list):
+            arg = args_list[i]
+            
+            if not isinstance(arg, str):
+                redacted_args.append(arg)
+                i += 1
+                continue
+            
+            if arg in self.HOSTNAME_CLI_FLAGS:
+                redacted_args.append(arg)
+                if i + 1 < len(args_list):
+                    i += 1
+                    next_val = args_list[i]
+                    if isinstance(next_val, str):
+                        if '=' in next_val and '://' in next_val:
+                            redacted_args.append(self._redact_cluster_spec(next_val))
+                        elif '://' in next_val:
+                            redacted_args.append(self._redact_url(next_val))
+                        else:
+                            redacted_args.append(self._redact_hostname(next_val))
+                    else:
+                        redacted_args.append(next_val)
+            elif arg in self.SKIP_CLI_FLAGS:
+                redacted_args.append(arg)
+                if i + 1 < len(args_list):
+                    i += 1
+                    redacted_args.append(args_list[i])
+            else:
+                if '://' in arg:
+                    redacted_args.append(self._redact_url(arg))
+                else:
+                    redacted_args.append(arg)
+            
+            i += 1
+        
+        return redacted_args
+
+    # =========================================================================
+    # STANDARD REGEX-BASED REDACTION
+    # =========================================================================
+
+    def _redact_ips(self, text: str) -> str:
+        """Redact IPv4 addresses."""
+        ip_pattern = r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b'
         
         def replace_ip(match):
-            ip = match.group(0)
+            ip = match.group(1)
+            try:
+                parts = [int(p) for p in ip.split('.')]
+                if not all(0 <= p <= 255 for p in parts):
+                    return ip
+            except ValueError:
+                return ip
+            
+            if self._is_reserved_ip(ip):
+                return ip
+            
             return self._get_or_create_redacted_id(ip, self.ip_mapping, 'IP')
         
-        return re.sub(ipv4_pattern, replace_ip, text)
-    
-    def _redact_ipv6(self, text: str) -> str:
-        """Redact IPv6 addresses."""
-        ipv6_pattern = r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,7}:\b|\b(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}\b|\b(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}\b|\b(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}\b|\b[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}\b|\b:(?::[0-9a-fA-F]{1,4}){1,7}\b|\b::(?:[fF]{4}:)?(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
-        
-        def replace_ip(match):
-            ip = match.group(0)
-            return self._get_or_create_redacted_id(ip, self.ip_mapping, 'IP')
-        
-        return re.sub(ipv6_pattern, replace_ip, text, flags=re.IGNORECASE)
-    
+        return re.sub(ip_pattern, replace_ip, text)
+
     def _redact_guids(self, text: str) -> str:
         """Redact GUIDs/UUIDs."""
-        guid_pattern = r'[{]?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[}]?'
+        guid_pattern = r'\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b'
         
         def replace_guid(match):
-            guid = match.group(0)
-            return self._get_or_create_redacted_id(guid, self.guid_mapping, 'GUID')
+            return self._get_or_create_redacted_id(match.group(1), self.guid_mapping, 'GUID')
         
-        return re.sub(guid_pattern, replace_guid, text, flags=re.IGNORECASE)
-    
-    def _redact_hostnames(self, text: str) -> str:
-        """Redact hostnames (FQDNs and common hostname patterns)."""
-        hostname_pattern = r'\b(?!(?:\d{1,3}\.){3}\d{1,3}\b)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+(?:[a-zA-Z]{2,})\b'
+        return re.sub(guid_pattern, replace_guid, text)
+
+    def _redact_emails(self, text: str) -> str:
+        """Redact email addresses."""
+        email_pattern = r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b'
         
-        common_tlds = {'com', 'net', 'org', 'edu', 'gov', 'io', 'co', 'local', 
-                       'internal', 'corp', 'lan', 'home', 'localdomain', 'dev',
-                       'test', 'example', 'invalid', 'localhost', 'domain'}
+        def replace_email(match):
+            return self._get_or_create_redacted_id(match.group(1), self.email_mapping, 'EMAIL')
         
-        def replace_hostname(match):
-            hostname = match.group(0)
+        return re.sub(email_pattern, replace_email, text)
+
+    def _redact_macs(self, text: str) -> str:
+        """Redact MAC addresses."""
+        mac_pattern = r'\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b'
+        
+        def replace_mac(match):
+            return self._get_or_create_redacted_id(match.group(1), self.mac_mapping, 'MAC')
+        
+        return re.sub(mac_pattern, replace_mac, text)
+
+    def _redact_splunk_connection_ids(self, text: str) -> str:
+        """Redact Splunk connectionId fields containing IPs."""
+        conn_pattern = r'(connectionId["\s:=]+)connection_(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})_'
+        
+        def replace_conn(match):
+            prefix = match.group(1)
+            ip = match.group(2)
             
-            # Skip if it's a filename with excluded extension
-            if self._is_excluded_filename(hostname):
-                return hostname
+            if self._is_reserved_ip(ip):
+                return match.group(0)
             
-            parts = hostname.lower().split('.')
-            if parts[-1] in common_tlds or len(parts) >= 2:
-                return self._get_or_create_redacted_id(hostname, self.hostname_mapping, 'HOST')
-            return hostname
+            redacted_ip = self._get_or_create_redacted_id(ip, self.ip_mapping, 'IP')
+            return f'{prefix}connection_{redacted_ip}_'
         
-        return re.sub(hostname_pattern, replace_hostname, text, flags=re.IGNORECASE)
-    
+        return re.sub(conn_pattern, replace_conn, text)
+
+    # =========================================================================
+    # MAIN REDACTION PIPELINE
+    # =========================================================================
+
     def redact_line(self, line: str) -> str:
-        """
-        Redact all sensitive information from a single line.
-        """
-        # Order matters - process most specific patterns first
+        """Apply all redaction rules to a single line."""
+        if not line.strip():
+            return line
         
-        # 1. Redact connectionId first (contains embedded IPs, hostnames, GUIDs)
-        result = self._redact_connection_id(line)
+        self.stats['lines_processed'] += 1
+        stripped = line.strip()
         
-        # 2. Redact system info patterns (Linux, hostname, kernel...)
-        result = self._redact_system_info(result)
+        # Check for Splunk metrics.log format first
+        if self._is_splunk_metrics_line(stripped):
+            result = self._redact_splunk_metrics_line(line)
+            result = self._redact_guids(result)
+            result = self._redact_emails(result)
+            result = self._redact_macs(result)
+            result = self._redact_ips(result)
+            return result
         
-        # 3. Redact node references (Node hostname is...)
-        result = self._redact_node_references(result)
+        # Try JSON-aware redaction
+        if stripped.startswith('{') and stripped.endswith('}'):
+            try:
+                data = json.loads(stripped)
+                redacted_data = self._redact_json_object(data)
+                
+                if 'args' in redacted_data and isinstance(redacted_data['args'], list):
+                    redacted_data['args'] = self._redact_etcd_args_array(redacted_data['args'])
+                
+                line_ending = line[len(stripped):] if len(line) > len(stripped) else ''
+                return json.dumps(redacted_data, separators=(',', ':')) + line_ending
+                
+            except json.JSONDecodeError:
+                pass
         
-        # 4. Redact server name declarations (e.g., "My server name is")
-        result = self._redact_server_name_declarations(result)
-        
-        # 5. Redact key=value hostname patterns (e.g., node=sh2, host=server01, host_src=sh2, label=sh2)
-        result = self._redact_key_value_hostnames(result)
-        
-        # 6. Redact JSON hostname fields (catches simple hostnames like "sniffles", "label":"sh2")
-        result = self._redact_json_hostname_fields(result)
-        
-        # 7. Redact data-host fields
-        result = self._redact_data_host(result)
-        
-        # 8. Redact emails
-        result = self._redact_emails(result)
-        
-        # 9. Redact GUIDs
+        # Regex-based fallback for other formats
+        result = line
+        result = self._redact_splunk_metrics_line(result)  # Try metrics redaction anyway
+        result = self._redact_splunk_connection_ids(result)
         result = self._redact_guids(result)
-        
-        # 10. Redact MAC addresses
-        result = self._redact_mac_addresses(result)
-        
-        # 11. Redact IP addresses (including embedded ones)
-        result = self._redact_ipv4(result)
-        result = self._redact_ipv6(result)
-        
-        # 12. Redact FQDN hostnames
-        result = self._redact_hostnames(result)
+        result = self._redact_emails(result)
+        result = self._redact_macs(result)
+        result = self._redact_ips(result)
         
         return result
-    
-    def redact(self, text: str) -> str:
-        """
-        Redact all sensitive information from the given text.
-        """
-        lines = text.split('\n')
-        redacted_lines = [self.redact_line(line) for line in lines]
-        return '\n'.join(redacted_lines)
-    
-    def redact_file(self, input_path: str, output_path: str, 
-                    include_header: bool = True,
-                    include_mapping_report: bool = False) -> Dict[str, int]:
-        """
-        Redact a log file and write the result to a new file.
-        """
+
+    def redact_file(
+        self, 
+        input_path: str, 
+        output_path: str = None,
+        encoding: str = 'utf-8'
+    ) -> str:
+        """Redact an entire file."""
         input_file = Path(input_path)
+        
+        if output_path is None:
+            output_path = input_file.parent / f"{input_file.stem}_redacted{input_file.suffix}"
+        
         output_file = Path(output_path)
         
-        if not input_file.exists():
-            raise FileNotFoundError(f"Input file not found: {input_path}")
-        
-        line_count = 0
-        
-        with open(input_file, 'r', encoding='utf-8') as infile, \
-             open(output_file, 'w', encoding='utf-8') as outfile:
-            
-            if include_header:
-                header = self._generate_file_header(input_path, output_path)
-                outfile.write(header)
-                outfile.write("\n")
+        with open(input_file, 'r', encoding=encoding, errors='replace') as infile, \
+             open(output_file, 'w', encoding=encoding) as outfile:
             
             for line in infile:
                 redacted_line = self.redact_line(line)
                 outfile.write(redacted_line)
-                line_count += 1
-            
-            if include_mapping_report:
-                outfile.write("\n\n")
-                outfile.write(self.get_mapping_report())
         
-        stats = self.get_statistics()
-        stats['lines_processed'] = line_count
-        
-        return stats
-    
-    def redact_file_streaming(self, input_path: str, output_path: str,
-                               buffer_size: int = 8192) -> Dict[str, int]:
-        """Redact a large log file using streaming to minimize memory usage."""
-        input_file = Path(input_path)
-        output_file = Path(output_path)
-        
-        if not input_file.exists():
-            raise FileNotFoundError(f"Input file not found: {input_path}")
-        
-        line_count = 0
-        
-        with open(input_file, 'r', encoding='utf-8', buffering=buffer_size) as infile, \
-             open(output_file, 'w', encoding='utf-8', buffering=buffer_size) as outfile:
-            
-            for line in infile:
-                redacted_line = self.redact_line(line)
-                outfile.write(redacted_line)
-                line_count += 1
-        
-        stats = self.get_statistics()
-        stats['lines_processed'] = line_count
-        
-        return stats
-    
-    def _generate_file_header(self, input_path: str, output_path: str) -> str:
-        """Generate a header for the output file."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        header_lines = [
-            "#" + "=" * 78,
-            "# REDACTED LOG FILE",
-            "#" + "=" * 78,
-            f"# Generated:     {timestamp}",
-            f"# Source file:   {input_path}",
-            f"# Output file:   {output_path}",
-            "#",
-            "# Redacted items: IP addresses, hostnames, GUIDs, emails, MAC addresses,",
-            "#                 data-host fields, connection IDs, server name declarations,",
-            "#                 key=value hostname patterns, system info, node references",
-            "# Excluded: Configuration files (.conf, .cfg, .yaml, etc.)",
-            "# Each unique item is assigned a consistent random identifier.",
-            "#" + "=" * 78,
-            ""
-        ]
-        return "\n".join(header_lines)
-    
-    def get_statistics(self) -> Dict[str, int]:
-        """Get statistics about redacted items."""
-        return {
-            'ip_addresses': len(self.ip_mapping),
-            'hostnames': len(self.hostname_mapping),
-            'guids': len(self.guid_mapping),
-            'emails': len(self.email_mapping),
-            'mac_addresses': len(self.mac_mapping),
-            'data_hosts': len(self.data_host_mapping),
-            'connection_ids': len(self.connection_id_mapping),
-            'total': (len(self.ip_mapping) + len(self.hostname_mapping) + 
-                     len(self.guid_mapping) + len(self.email_mapping) + 
-                     len(self.mac_mapping) + len(self.data_host_mapping) +
-                     len(self.connection_id_mapping))
-        }
-    
-    def get_mapping_report(self) -> str:
-        """Generate a report of all redacted items and their mappings."""
-        stats = self.get_statistics()
-        
-        report_lines = [
-            "=" * 78,
-            "REDACTION MAPPING REPORT",
-            "=" * 78,
-            "",
-            "SUMMARY:",
-            "-" * 40,
-            f"  IP addresses redacted:    {stats['ip_addresses']}",
-            f"  Hostnames redacted:       {stats['hostnames']}",
-            f"  GUIDs redacted:           {stats['guids']}",
-            f"  Email addresses redacted: {stats['emails']}",
-            f"  MAC addresses redacted:   {stats['mac_addresses']}",
-            f"  Data-host fields redacted:{stats['data_hosts']}",
-            f"  Connection IDs redacted:  {stats['connection_ids']}",
-            "-" * 40,
-            f"  TOTAL UNIQUE ITEMS:       {stats['total']}",
-            "",
-        ]
-        
-        if self.ip_mapping:
-            report_lines.append("-" * 78)
-            report_lines.append("IP ADDRESS MAPPINGS:")
-            report_lines.append("-" * 78)
-            for original, redacted in sorted(self.ip_mapping.items()):
-                report_lines.append(f"  {original:<45} -> {redacted}")
-            report_lines.append("")
-        
-        if self.hostname_mapping:
-            report_lines.append("-" * 78)
-            report_lines.append("HOSTNAME MAPPINGS:")
-            report_lines.append("-" * 78)
-            for original, redacted in sorted(self.hostname_mapping.items()):
-                report_lines.append(f"  {original:<45} -> {redacted}")
-            report_lines.append("")
-        
-        if self.guid_mapping:
-            report_lines.append("-" * 78)
-            report_lines.append("GUID MAPPINGS:")
-            report_lines.append("-" * 78)
-            for original, redacted in sorted(self.guid_mapping.items()):
-                report_lines.append(f"  {original:<45} -> {redacted}")
-            report_lines.append("")
-        
-        if self.email_mapping:
-            report_lines.append("-" * 78)
-            report_lines.append("EMAIL ADDRESS MAPPINGS:")
-            report_lines.append("-" * 78)
-            for original, redacted in sorted(self.email_mapping.items()):
-                report_lines.append(f"  {original:<45} -> {redacted}")
-            report_lines.append("")
-        
-        if self.mac_mapping:
-            report_lines.append("-" * 78)
-            report_lines.append("MAC ADDRESS MAPPINGS:")
-            report_lines.append("-" * 78)
-            for original, redacted in sorted(self.mac_mapping.items()):
-                report_lines.append(f"  {original:<45} -> {redacted}")
-            report_lines.append("")
-        
-        if self.data_host_mapping:
-            report_lines.append("-" * 78)
-            report_lines.append("DATA-HOST FIELD MAPPINGS:")
-            report_lines.append("-" * 78)
-            for original, redacted in sorted(self.data_host_mapping.items()):
-                report_lines.append(f"  {original:<45} -> {redacted}")
-            report_lines.append("")
-        
-        if self.connection_id_mapping:
-            report_lines.append("-" * 78)
-            report_lines.append("CONNECTION ID MAPPINGS:")
-            report_lines.append("-" * 78)
-            for original, redacted in sorted(self.connection_id_mapping.items()):
-                display_original = original if len(original) <= 60 else original[:57] + "..."
-                report_lines.append(f"  {display_original:<60}")
-                report_lines.append(f"    -> {redacted}")
-            report_lines.append("")
-        
-        report_lines.append("=" * 78)
-        
-        return "\n".join(report_lines)
-    
-    def export_mappings_to_json(self, filepath: str) -> None:
-        """Export all mappings to a JSON file."""
-        import json
-        
+        return str(output_file)
+
+    def export_mappings(self, output_path: str) -> None:
+        """Export redaction mappings to a file."""
         mappings = {
-            'generated_at': datetime.now().isoformat(),
-            'ip_addresses': self.ip_mapping,
-            'hostnames': self.hostname_mapping,
-            'guids': self.guid_mapping,
-            'emails': self.email_mapping,
-            'mac_addresses': self.mac_mapping,
-            'data_hosts': self.data_host_mapping,
-            'connection_ids': self.connection_id_mapping,
-            'statistics': self.get_statistics()
+            'ip_mapping': {v: k for k, v in self.ip_mapping.items()},
+            'hostname_mapping': {v: k for k, v in self.hostname_mapping.items()},
+            'guid_mapping': {v: k for k, v in self.guid_mapping.items()},
+            'email_mapping': {v: k for k, v in self.email_mapping.items()},
+            'mac_mapping': {v: k for k, v in self.mac_mapping.items()},
+            'statistics': self.stats
         }
         
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with open(output_path, 'w') as f:
             json.dump(mappings, f, indent=2)
-    
-    def export_mappings_to_csv(self, filepath: str) -> None:
-        """Export all mappings to a CSV file."""
-        import csv
-        
-        with open(filepath, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Type', 'Original Value', 'Redacted Value'])
-            
-            for original, redacted in self.ip_mapping.items():
-                writer.writerow(['IP Address', original, redacted])
-            
-            for original, redacted in self.hostname_mapping.items():
-                writer.writerow(['Hostname', original, redacted])
-            
-            for original, redacted in self.guid_mapping.items():
-                writer.writerow(['GUID', original, redacted])
-            
-            for original, redacted in self.email_mapping.items():
-                writer.writerow(['Email', original, redacted])
-            
-            for original, redacted in self.mac_mapping.items():
-                writer.writerow(['MAC Address', original, redacted])
-            
-            for original, redacted in self.data_host_mapping.items():
-                writer.writerow(['Data-Host', original, redacted])
-            
-            for original, redacted in self.connection_id_mapping.items():
-                writer.writerow(['Connection ID', original, redacted])
-    
-    def clear_mappings(self) -> None:
-        """Clear all stored mappings."""
-        self.ip_mapping.clear()
-        self.hostname_mapping.clear()
-        self.guid_mapping.clear()
-        self.email_mapping.clear()
-        self.mac_mapping.clear()
-        self.data_host_mapping.clear()
-        self.connection_id_mapping.clear()
-    
-    def add_excluded_extension(self, extension: str) -> None:
-        """
-        Add a file extension to the exclusion list.
-        
-        Args:
-            extension: File extension to exclude (e.g., '.myext')
-        """
-        if not extension.startswith('.'):
-            extension = '.' + extension
-        self.EXCLUDED_FILE_EXTENSIONS.add(extension.lower())
-        self._excluded_extensions_pattern = self._build_excluded_extensions_pattern()
-    
-    def remove_excluded_extension(self, extension: str) -> None:
-        """
-        Remove a file extension from the exclusion list.
-        
-        Args:
-            extension: File extension to remove (e.g., '.conf')
-        """
-        if not extension.startswith('.'):
-            extension = '.' + extension
-        self.EXCLUDED_FILE_EXTENSIONS.discard(extension.lower())
-        self._excluded_extensions_pattern = self._build_excluded_extensions_pattern()
+
+    def print_stats(self) -> None:
+        """Print redaction statistics."""
+        print("\n" + "=" * 50)
+        print("REDACTION STATISTICS")
+        print("=" * 50)
+        print(f"Lines processed:    {self.stats['lines_processed']:,}")
+        print(f"IPs redacted:       {self.stats['ips']:,}")
+        print(f"Hostnames redacted: {self.stats['hostnames']:,}")
+        print(f"GUIDs redacted:     {self.stats['guids']:,}")
+        print(f"Emails redacted:    {self.stats['emails']:,}")
+        print(f"MACs redacted:      {self.stats['macs']:,}")
+        print(f"\nUnique values:")
+        print(f"  IPs:       {len(self.ip_mapping)}")
+        print(f"  Hostnames: {len(self.hostname_mapping)}")
+        print(f"  GUIDs:     {len(self.guid_mapping)}")
+        print(f"  Emails:    {len(self.email_mapping)}")
+        print(f"  MACs:      {len(self.mac_mapping)}")
+        print("=" * 50)
 
 
-def create_sample_log_file(filepath: str) -> None:
-    """Create a sample log file for testing including Splunk-style logs."""
-    sample_logs = """2024-01-15 10:23:45 INFO  Connection established from 192.168.1.100 to server01.company.com
-2024-01-15 10:23:46 DEBUG User session GUID: 550e8400-e29b-41d4-a716-446655440000 started
-2024-01-15 10:23:47 WARN  Failed login attempt from 10.0.0.55 for user admin@internal.corp.net
-2024-01-15 10:23:48 ERROR Database connection failed to db-master.datacenter.local (192.168.1.100)
-02-18-2026 16:34:53.513 +0000 INFO  ServerConfig [0 MainThread] - My server name is "sh2".
-02-18-2026 16:35:08.224 +0000 INFO  WorkloadManager [5097 MainThread] - Workload management for splunk node=sh2 with guid=B522CEA3-7295-4E59-B8FF-0B619FBA1847 has been disabled.
-02-18-2026 16:35:08.196 +0000 WARN  HTTPAuthManager [5097 MainThread] - pass4SymmKey length is too short. See pass4SymmKey_minLength under the general stanza in server.conf.
-02-18-2026 16:35:08.197 +0000 INFO  ConfigManager [5097 MainThread] - Loading configuration from inputs.conf and outputs.conf
-02-18-2026 16:35:08.198 +0000 DEBUG ConfigManager [5097 MainThread] - Reading props.conf and transforms.conf
-02-18-2026 16:46:35.688 +0000 ERROR SHCRaftConsensus [12602 TcpChannelThread] - Node sh2 is already part of cluster id=B522CEA3-7295-4E59-B8FF-0B619FBA1847.
-02-18-2026 16:54:20.904 +0000 INFO  loader [15153 MainThread] - System info: Linux, sh2, 6.8.0-1033-aws, #35~22.04.1-Ubuntu SMP Wed Jul 23 17:51:00 UTC 2025, x86_64.
-02-18-2026 16:54:20.929 +0000 INFO  LMTracker [15153 MainThread] - init'ing peerId=B522CEA3-7295-4E59-B8FF-0B619FBA1847 label=sh2 [30,30,self]
-02-18-2026 16:46:12.049 +0000 INFO  ServerConfig [12619 AuditSearchExecutor] - Using REMOTE_SERVER_NAME=sh2
-02-18-2026 16:47:49.749 +0000 INFO  SHCMaster [12595 TcpChannelThread] - SHCluster membership: {"captain":{"label":"sh2","id":"B522CEA3-7295-4E59-B8FF-0B619FBA1847"}}
-02-18-2026 16:55:00.000 +0000 INFO  AppManager [5097 MainThread] - See documentation in README.txt and config.yaml
-02-18-2026 16:55:01.000 +0000 DEBUG ScriptRunner [5097 MainThread] - Executing script.py and helper.sh
-"""
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(sample_logs)
-
-
-def parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments."""
+def main():
+    """Main entry point for CLI usage."""
     parser = argparse.ArgumentParser(
         description='Redact sensitive information from log files.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s input.log output_redacted.log
-  %(prog)s input.log output.log --mapping-report
-  %(prog)s input.log output.log --json-export mappings.json
-  %(prog)s input.log output.log --csv-export mappings.csv --no-header
-  %(prog)s --demo
+  %(prog)s input.log
+  %(prog)s input.log -o redacted.log
+  %(prog)s input.log --export-mappings mappings.json
+  %(prog)s input.log --seed 42
         """
     )
     
-    parser.add_argument('input_file', nargs='?', help='Path to the input log file')
-    parser.add_argument('output_file', nargs='?', help='Path to the output redacted log file')
-    parser.add_argument('--demo', action='store_true', help='Run demonstration with sample data')
-    parser.add_argument('--no-header', action='store_true', help='Do not include header in output file')
-    parser.add_argument('--mapping-report', action='store_true', help='Append mapping report to the output file')
-    parser.add_argument('--json-export', metavar='FILE', help='Export mappings to a JSON file')
-    parser.add_argument('--csv-export', metavar='FILE', help='Export mappings to a CSV file')
-    parser.add_argument('--seed', type=int, help='Random seed for reproducible redaction IDs')
-    parser.add_argument('--quiet', action='store_true', help='Suppress output messages')
+    parser.add_argument('input', help='Input log file path')
+    parser.add_argument('-o', '--output', help='Output file path')
+    parser.add_argument('--export-mappings', help='Export mappings to file')
+    parser.add_argument('--seed', type=int, help='Random seed for reproducible IDs')
+    parser.add_argument('--quiet', action='store_true', help='Suppress statistics output')
     
-    return parser.parse_args()
-
-
-def print_statistics(stats: Dict[str, int], quiet: bool = False) -> None:
-    """Print redaction statistics."""
-    if quiet:
-        return
+    args = parser.parse_args()
     
-    print("\n" + "=" * 50)
-    print("REDACTION COMPLETE")
-    print("=" * 50)
-    print(f"  Lines processed:      {stats.get('lines_processed', 'N/A')}")
-    print(f"  IP addresses:         {stats['ip_addresses']}")
-    print(f"  Hostnames:            {stats['hostnames']}")
-    print(f"  GUIDs:                {stats['guids']}")
-    print(f"  Email addresses:      {stats['emails']}")
-    print(f"  MAC addresses:        {stats['mac_addresses']}")
-    print(f"  Data-host fields:     {stats['data_hosts']}")
-    print(f"  Connection IDs:       {stats['connection_ids']}")
-    print("-" * 50)
-    print(f"  TOTAL UNIQUE ITEMS:   {stats['total']}")
-    print("=" * 50)
-
-
-def run_demo() -> None:
-    """Run a demonstration with sample data."""
-    print("=" * 78)
-    print("LOG REDACTION TOOL - DEMONSTRATION")
-    print("=" * 78)
-    
-    sample_input = 'sample_input.log'
-    sample_output = 'sample_output_redacted.log'
-    
-    print(f"\n[1] Creating sample log file: {sample_input}")
-    create_sample_log_file(sample_input)
-    
-    print(f"\n[2] Original log content:")
-    print("-" * 78)
-    with open(sample_input, 'r') as f:
-        print(f.read())
-    
-    print(f"\n[3] Redacting log file...")
-    redactor = LogRedactor(seed=42)
-    stats = redactor.redact_file(sample_input, sample_output, include_header=True, include_mapping_report=True)
-    
-    print(f"\n[4] Redacted log content ({sample_output}):")
-    print("-" * 78)
-    with open(sample_output, 'r') as f:
-        print(f.read())
-    
-    print_statistics(stats)
-    
-    json_file = 'sample_mappings.json'
-    csv_file = 'sample_mappings.csv'
-    
-    redactor.export_mappings_to_json(json_file)
-    redactor.export_mappings_to_csv(csv_file)
-    
-    print(f"\n[5] Exported mappings to:")
-    print(f"    - {json_file}")
-    print(f"    - {csv_file}")
-    
-    print("\n" + "=" * 78)
-    print("DEMONSTRATION COMPLETE")
-    print("=" * 78)
-
-
-def main():
-    """Main entry point for the script."""
-    args = parse_arguments()
-    
-    if args.demo:
-        run_demo()
-        return
-    
-    if not args.input_file or not args.output_file:
-        print("Error: Both input_file and output_file are required.")
-        print("Use --demo for a demonstration or --help for usage information.")
+    if not Path(args.input).exists():
+        print(f"Error: Input file '{args.input}' not found.", file=sys.stderr)
         sys.exit(1)
     
     redactor = LogRedactor(seed=args.seed)
     
-    try:
-        if not args.quiet:
-            print(f"Processing: {args.input_file} -> {args.output_file}")
-        
-        stats = redactor.redact_file(
-            args.input_file,
-            args.output_file,
-            include_header=not args.no_header,
-            include_mapping_report=args.mapping_report
-        )
-        
-        print_statistics(stats, args.quiet)
-        
-        if args.json_export:
-            redactor.export_mappings_to_json(args.json_export)
-            if not args.quiet:
-                print(f"Mappings exported to: {args.json_export}")
-        
-        if args.csv_export:
-            redactor.export_mappings_to_csv(args.csv_export)
-            if not args.quiet:
-                print(f"Mappings exported to: {args.csv_export}")
-        
-        if not args.quiet:
-            print(f"\nRedacted log file saved to: {args.output_file}")
+    print(f"Processing: {args.input}")
+    output_path = redactor.redact_file(args.input, args.output)
+    print(f"Output: {output_path}")
     
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    if args.export_mappings:
+        redactor.export_mappings(args.export_mappings)
+        print(f"Mappings exported to: {args.export_mappings}")
+    
+    if not args.quiet:
+        redactor.print_stats()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
